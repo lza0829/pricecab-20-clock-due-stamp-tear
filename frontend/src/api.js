@@ -23,6 +23,8 @@ export const api = {
   ticket: (id) => request(`/api/tickets/${id}`),
   createTicket: (body) => request('/api/tickets', { method: 'POST', body: JSON.stringify(body) }),
   clock: () => request('/api/apply/clock'),
+  clockAudit: () => request('/api/apply/clock-audit'),
+  repairClock: () => request('/api/apply/clock/repair', { method: 'POST' }),
   setClock: (business_clock) =>
     request('/api/apply/clock', { method: 'PUT', body: JSON.stringify({ business_clock }) }),
   applyDue: (hold_ms) =>

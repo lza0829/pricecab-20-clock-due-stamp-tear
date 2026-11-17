@@ -99,6 +99,24 @@ def init_schema(conn) -> None:
         INSERT OR IGNORE INTO apply_lock(id) VALUES (1);
         '''
     )
+    _ensure_apply_batch_columns(conn)
+
+
+# 批次必须同时记住「扫描用的钟」与「戳记的钟」，二者由同一设置键读出。
+# 老库补列；不回溯填 scan_clock：老批次是否戳记错误，交给分叉审计按
+# 「批次内单的生效时刻 / 同戳记下应扫未扫的单」互证，不能用当前钟倒填掩盖。
+_APPLY_BATCH_COLUMNS = (
+    ("scan_clock", "TEXT"),
+    ("voided_at", "TEXT"),
+    ("void_reason", "TEXT"),
+)
+
+
+def _ensure_apply_batch_columns(conn) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(apply_batches)")}
+    for name, ddl in _APPLY_BATCH_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE apply_batches ADD COLUMN {name} {ddl}")
 
 
 def seed_if_empty() -> None:
@@ -131,14 +149,12 @@ def seed_if_empty() -> None:
                 "INSERT INTO sales_fixture(sale_no, sku_code, sold_at, unit_price, qty) VALUES (?,?,?,?,?)",
                 (row["sale_no"], row["sku_code"], row["sold_at"], float(row["unit_price"]), int(row["qty"])),
             )
-        conn.execute(
-            "INSERT OR REPLACE INTO settings(key, value) VALUES ('business_clock', ?)",
-            ("2026-11-16T09:00:00Z",
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO settings(key, value) VALUES ('ui_clock', ?)",
-            ("2026-11-16T09:00:00Z",),
-        )
+        # 业务钟只有一个生效键；ui_clock 只作遗留兼容镜像，判定一律读 business_clock。
+        for key in ("business_clock", "ui_clock"):
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                (key, "2026-11-16T09:00:00Z"),
+            )
         conn.execute(
             "INSERT OR REPLACE INTO settings(key, value) VALUES ('clock_label', ?)",
             ("业务钟（可拨，用于判断改价是否到期）",),

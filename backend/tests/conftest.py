@@ -53,7 +53,7 @@ def reset_state(*, policy: str = "apply_first", lock_timeout: float = 30.0) -> N
             "UPDATE apply_lock SET holder='', holder_kind='', acquired_at='', expires_at='', "
             "acquired_epoch=0, expires_epoch=0, fence=fence+1, released_at=NULL WHERE id=1"
         )
-        conn.execute("DELETE FROM settings WHERE key IN ('business_clock','apply_conflict_policy','apply_lock_timeout_seconds')")
+        conn.execute("DELETE FROM settings WHERE key IN ('business_clock','ui_clock','apply_conflict_policy','apply_lock_timeout_seconds')")
         for row in conn.execute("SELECT sku_code, list_price FROM skus ORDER BY id").fetchall():
             conn.execute(
                 "INSERT INTO price_book(sku_code, current_price, source_ticket_no, effective_at, updated_at) "
@@ -66,6 +66,9 @@ def reset_state(*, policy: str = "apply_first", lock_timeout: float = 30.0) -> N
                 (row["sku_code"], row["list_price"]),
             )
         conn.execute("INSERT INTO settings(key, value) VALUES ('business_clock', '2026-11-16T09:00:00Z')")
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('ui_clock', '2026-11-16T09:00:00Z')"
+        )
         policy_repo.set_value(conn, policy)
         conn.execute(
             "INSERT INTO settings(key, value) VALUES ('apply_lock_timeout_seconds', ?) "

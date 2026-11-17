@@ -1,4 +1,3 @@
-from app.services import clock_plane
 from __future__ import annotations
 
 from typing import Any
@@ -6,13 +5,15 @@ from typing import Any
 from app.db import connect
 from app.repositories import sales as sales_repo
 from app.repositories import prices as price_repo
+from app.services import clock_audit, clock_plane
 
 
 def reconcile_sales() -> dict[str, Any]:
-    _display_clock = clock_plane.read_display_clock()
     """Compare each sale's unit_price with the price book value effective at sold_at."""
     conn = connect()
     try:
+        # 对账钉扎读唯一业务钟；与拨钟入口、到期扫描、批次戳记是同一个键。
+        pinned_clock = clock_plane.read_clock(conn)
         sales = sales_repo.list_sales(conn)
         rows = []
         match = 0
@@ -43,7 +44,9 @@ def reconcile_sales() -> dict[str, Any]:
             )
         return {
             "sale_count": len(sales),
-            "pinned_clock": _display_clock,
+            "pinned_clock": pinned_clock,
+            "pinned_clock_key": clock_plane.CLOCK_KEY,
+            "pinned_clock_source": clock_audit.CLOCK_AUTHORITY,
             "match_count": match,
             "mismatch_count": mismatch,
             "missing_count": missing,

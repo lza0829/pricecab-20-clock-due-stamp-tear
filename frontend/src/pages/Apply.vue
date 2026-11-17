@@ -8,6 +8,7 @@ const batches = ref([])
 const lock = ref(null)
 const conflicts = ref([])
 const aborts = ref([])
+const audit = ref(null)
 const msg = ref('')
 const err = ref('')
 const result = ref(null)
@@ -19,14 +20,16 @@ const policy = computed(() => lock.value?.policy || 'apply_first')
 const policyLabel = computed(() => lock.value?.policy_label || '应用优先')
 const isHeld = computed(() => !!lock.value?.held)
 const holder = computed(() => lock.value?.lock || null)
+const hasFork = computed(() => (audit.value?.fork_count || 0) > 0)
 
 async function refresh() {
-  const [c, b, l, cf, af] = await Promise.all([
+  const [c, b, l, cf, af, au] = await Promise.all([
     api.clock(),
     api.batches(),
     api.applyLock(),
     api.conflicts(),
     api.aborts(),
+    api.clockAudit(),
   ])
   clock.value = c.business_clock || ''
   savedClock.value = c.business_clock || ''
@@ -34,6 +37,7 @@ async function refresh() {
   lock.value = l
   conflicts.value = cf
   aborts.value = af
+  audit.value = au
 }
 
 async function saveClock() {
@@ -57,14 +61,29 @@ async function applyDue() {
   busy.value = true
   try {
     result.value = await api.applyDue(holdMs.value || undefined)
+    const reverted = result.value.reverted_batches?.length
     msg.value = result.value.applied
-      ? `已应用 ${result.value.ticket_count} 张改价单（批次 ${result.value.batch_no}）`
+      ? `${reverted ? `已收口 ${reverted} 个分叉批次并按当前钟重扫；` : ''}已应用 ${result.value.ticket_count} 张改价单（批次 ${result.value.batch_no}，钟 ${result.value.batch_clock_at}）`
       : result.value.message
   } catch (e) {
     err.value = e.message
   } finally {
     busy.value = false
     await refresh().catch(() => {})
+  }
+}
+
+async function repairFork() {
+  msg.value = ''
+  err.value = ''
+  try {
+    const r = await api.repairClock()
+    msg.value = r.repaired_batches?.length
+      ? `已以业务钟 ${r.business_clock} 为准作废 ${r.repaired_batches.length} 个分叉批次并回滚，请重新「应用到期」重扫`
+      : `钟面一致，无需收口（当前业务钟 ${r.business_clock}）`
+    await refresh()
+  } catch (e) {
+    err.value = e.message
   }
 }
 
@@ -165,29 +184,59 @@ onUnmounted(() => {
       </button>
     </div>
     <p class="muted-note">
-      应用会读取到期集合、写价签/历史、更新单状态、落批次，四步同成同败。模拟耗时超过锁超时会触发整批回滚。
+      拨钟入口、到期扫描、批次戳记、对账钉扎读同一个设置键 <code>business_clock</code>；页面上「已过」与「可应用」不会各说各话。
     </p>
     <p v-if="msg" class="msg ok">{{ msg }}</p>
     <p v-if="err" class="msg err">{{ err }}</p>
     <pre v-if="result" style="margin-top:12px;font-size:0.82rem;color:var(--muted);white-space:pre-wrap">{{ JSON.stringify(result, null, 2) }}</pre>
   </div>
 
+  <div v-if="audit" class="panel">
+    <h2>钟面一致性</h2>
+    <div class="row" style="flex-wrap:wrap;align-items:center">
+      <span class="tag" :class="audit.aligned ? 'ok' : 'bad'">{{ audit.aligned ? '扫描钟 = 设置钟' : '存在分叉' }}</span>
+      <span class="kv">设置钟 {{ audit.business_clock }}</span>
+      <span class="kv">扫描钟 {{ audit.scan_clock }}</span>
+      <span class="kv">对账钉扎 {{ audit.pinned_clock }}</span>
+      <span v-if="!audit.legacy_mirror_aligned" class="kv">遗留展示键 {{ audit.legacy_ui_clock }}</span>
+      <button v-if="hasFork || !audit.legacy_mirror_aligned" class="btn ghost" type="button" :disabled="busy" @click="repairFork">
+        以设置钟为准收口分叉
+      </button>
+    </div>
+    <p class="muted-note">
+      收口只认设置表业务钟：作废戳记/扫描错误的成功批次并回滚其价签与单态，之后按当前钟重扫；不会反过来用批次时刻改写设置钟。
+    </p>
+    <div v-if="hasFork" class="fork-list">
+      <p class="msg err">发现 {{ audit.fork_count }} 个分叉批次（收口前不得沿用）</p>
+      <ul>
+        <li v-for="f in audit.forked_batches" :key="f.batch_no">
+          <strong>{{ f.batch_no }}</strong> · 批次钟 {{ f.clock_at }} · 扫描钟 {{ f.scan_clock ?? '—' }}
+          <ul><li v-for="e in f.evidence" :key="e">{{ e }}</li></ul>
+        </li>
+      </ul>
+    </div>
+    <p v-if="audit.missed_due_tickets?.length" class="muted-note">
+      已到点待扫：{{ audit.missed_due_tickets.join('、') }}
+    </p>
+  </div>
+
   <div class="panel">
     <h2>应用批次</h2>
     <table>
       <thead>
-        <tr><th>批次</th><th>业务钟</th><th>改价单数</th><th>明细行</th><th>状态</th><th>时间</th></tr>
+        <tr><th>批次</th><th>扫描钟</th><th>戳记钟</th><th>改价单数</th><th>明细行</th><th>状态</th><th>时间</th></tr>
       </thead>
       <tbody>
         <tr v-for="b in batches" :key="b.id">
           <td>{{ b.batch_no }}</td>
+          <td>{{ b.scan_clock ?? '—' }}</td>
           <td>{{ b.clock_at }}</td>
           <td>{{ b.ticket_count }}</td>
           <td>{{ b.line_count }}</td>
-          <td><span class="tag ok">{{ b.status }}</span></td>
+          <td><span class="tag" :class="b.status === 'voided' ? 'bad' : 'ok'">{{ b.status }}</span></td>
           <td>{{ b.created_at }}</td>
         </tr>
-        <tr v-if="!batches.length"><td colspan="6" class="muted-note">暂无批次</td></tr>
+        <tr v-if="!batches.length"><td colspan="7" class="muted-note">暂无批次</td></tr>
       </tbody>
     </table>
   </div>
@@ -243,4 +292,7 @@ onUnmounted(() => {
 .policy-notes strong { color: var(--ink); }
 .kv { font-size: 0.85rem; color: var(--muted); }
 .muted-note { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+.fork-list { margin-top: 10px; }
+.fork-list ul { margin: 6px 0 0; padding-left: 20px; font-size: 0.85rem; color: var(--muted); }
+.fork-list > ul > li { margin-bottom: 8px; color: var(--ink); }
 </style>

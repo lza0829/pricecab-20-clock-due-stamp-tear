@@ -100,3 +100,28 @@ def mark_applied(
         ''',
         (applied_at, batch_id, ticket_id),
     )
+
+
+def list_by_batch(conn: sqlite3.Connection, batch_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM price_tickets WHERE apply_batch_id=? ORDER BY id",
+        (batch_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def revert_to_scheduled(conn: sqlite3.Connection, ticket_id: int) -> None:
+    """把单退回待生效：单状态、应用时刻、批次引用一并清空。"""
+    conn.execute(
+        '''
+        UPDATE price_tickets
+        SET status='scheduled', applied_at=NULL, apply_batch_id=NULL
+        WHERE id=?
+        ''',
+        (ticket_id,),
+    )
+
+
+def due_but_not_applied(conn: sqlite3.Connection, clock_at: str) -> list[dict[str, Any]]:
+    """当前钟下已到期却仍未 applied 的单（漏扫/待扫证据）。"""
+    return due_tickets(conn, clock_at)

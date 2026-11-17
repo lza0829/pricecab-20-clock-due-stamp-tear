@@ -18,6 +18,7 @@ from app.repositories import prices as price_repo
 from app.repositories import settings as settings_repo
 from app.repositories import signals as signal_repo
 from app.repositories import tickets as ticket_repo
+from app.services import clock_audit, clock_plane
 
 
 # 拨钟临界区只做一次读-判-写，持有时间极短。
@@ -90,7 +91,9 @@ def get_clock() -> dict[str, Any]:
     try:
         policy = policy_repo.get(conn)
         return {
-            "business_clock": settings_repo.get(conn, "ui_clock") or settings_repo.get(conn, "business_clock"),
+            # 拨钟入口与到期扫描读同一个设置键；不存在第二个「当前生效钟」。
+            "business_clock": clock_plane.read_clock(conn),
+            "clock_key": clock_plane.CLOCK_KEY,
             "clock_label": settings_repo.get(conn, "clock_label"),
             "policy": policy["policy"],
             "policy_label": policy["policy_label"],
@@ -128,6 +131,71 @@ def list_batches() -> list[dict[str, Any]]:
         return batch_repo.list_batches(conn)
     finally:
         conn.close()
+
+
+def clock_audit_snapshot() -> dict[str, Any]:
+    """钟面一致性快照（只读）：设置钟 / 扫描钟 / 戳记 / 对账钉扎互证。"""
+    return clock_audit.snapshot_clocks()
+
+
+def repair_clock_fork() -> dict[str, Any]:
+    """唯一收口：以设置表业务钟为准，作废并回滚戳记/扫描错误的成功批次。
+
+    收口与「应用到期」共用同一生效临界区，持锁后在同一写事务里完成
+    作废批次 → 回滚价签/历史 → 单退回待生效 → 遗留展示键对齐业务钟。
+    收口后并不自动重扫：本批已作废，必须再点「应用到期」按当前钟重扫。
+    """
+    holder = _new_holder("clock-repair")
+    policy = _current_policy()
+    fence, _ = _acquire_apply_lock(holder, policy)
+    try:
+        conn = connect(immediate=True, timeout=config.APPLY_LOCK_WAIT_SECONDS)
+        try:
+            if not lock_repo.holds(conn, holder, fence):
+                raise HTTPException(409, "持锁失效，钟面分叉未收口")
+
+            clock = clock_plane.read_clock(conn)
+            if not clock:
+                raise HTTPException(400, "业务钟未设置")
+
+            at = _now()
+            repaired: list[dict[str, Any]] = []
+            for item in clock_audit.detect_forked_batches(conn):
+                repaired.append(
+                    clock_audit.rollback_forked_batch(conn, item["batch"], at=at)
+                )
+
+            # 遗留展示键对齐到业务钟：之后任何入口都读不到第二个「当前钟」。
+            settings_repo.set_value(conn, clock_plane.LEGACY_DISPLAY_KEY, clock)
+
+            lock_repo.release(conn, holder, fence)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        _record_conflict(
+            kind="clock_fork_repaired",
+            policy=policy,
+            winner="clock",
+            loser="apply",
+            detail=(
+                f"以业务钟 {clock} 为准作废 {len(repaired)} 个分叉批次并回滚，"
+                "须按当前钟重扫"
+            ),
+        )
+    finally:
+        _release_held(holder, fence)
+
+    return {
+        "authority": clock_audit.CLOCK_AUTHORITY,
+        "business_clock": clock,
+        "repaired_batches": repaired,
+        "rescan_required": bool(repaired),
+        "clock_audit": clock_audit.snapshot_clocks(),
+    }
 
 
 def set_policy(policy: str, lock_timeout: float | None = None) -> dict[str, Any]:
@@ -356,7 +424,9 @@ def set_clock(clock_at: str) -> dict[str, Any]:
                 fence = lock_repo.acquire(
                     conn, holder=holder, kind="clock", ttl_seconds=CLOCK_LOCK_TTL_SECONDS
                 )
-                settings_repo.set_value(conn, "ui_clock", clock_at)
+                # 拨钟只写业务钟这一个生效键（遗留展示键同事务镜像），
+                # 到期扫描读到的就是这里落下的值，不存在两个时刻各说各话。
+                clock_plane.write_clock(conn, clock_at)
                 lock_repo.release(conn, holder, fence)
                 conn.commit()
             except HTTPException:
@@ -555,10 +625,22 @@ def _run_apply(
         if _preempted(policy):
             raise _AbortBatch("收到拨钟，应用中止", winner="clock")
 
-        clock = settings_repo.get(conn, "business_clock")
-            ui_clock = settings_repo.get(conn, "ui_clock") or clock
-            stamp_clock = ui_clock if ui_clock != clock else clock
+        # 钟面分叉先行收口：任何与业务钟矛盾的已成功批次先作废并回滚，
+        # 保证本批不会沿用错误戳记，也保证「已到点」的单不会被漏在作废批里。
+        forked = clock_audit.detect_forked_batches(conn)
+        reverted_batches: list[dict[str, Any]] = []
+        if forked:
+            at = _now()
+            for item in forked:
+                reverted_batches.append(
+                    clock_audit.rollback_forked_batch(conn, item["batch"], at=at)
+                )
+
+        # 扫描判定钟与批次戳记钟来自同一个设置键的同一次读取，本批不存在分叉。
+        clock = clock_plane.read_clock(conn)
         if not clock:
+            lock_repo.release(conn, holder, fence)
+            conn.commit()
             raise HTTPException(400, "业务钟未设置")
 
         due = ticket_repo.due_tickets(conn, clock)
@@ -569,8 +651,10 @@ def _run_apply(
                 "applied": False,
                 "message": "当前业务钟下没有到期改价单",
                 "business_clock": clock,
+                "scan_clock": clock,
                 "ticket_count": 0,
                 "line_count": 0,
+                "reverted_batches": reverted_batches,
                 "policy": policy,
                 "holder": holder,
                 "fence": fence,
@@ -583,7 +667,8 @@ def _run_apply(
         batch_id = batch_repo.create_batch(
             conn,
             batch_no=batch_no,
-            clock_at=stamp_clock,
+            clock_at=clock,
+            scan_clock=clock,
             ticket_count=0,
             line_count=0,
             status="running",
@@ -671,9 +756,12 @@ def _run_apply(
             "applied": True,
             "batch_no": batch_no,
             "business_clock": clock,
+            "scan_clock": clock,
+            "batch_clock_at": clock,
             "ticket_count": len(due),
             "line_count": line_total,
             "tickets": applied_tickets,
+            "reverted_batches": reverted_batches,
             "policy": policy,
             "holder": holder,
             "fence": fence,

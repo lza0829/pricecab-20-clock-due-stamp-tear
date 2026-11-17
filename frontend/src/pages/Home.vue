@@ -28,6 +28,12 @@ onMounted(async () => {
   <p v-if="err" class="msg err">{{ err }}</p>
   <div v-if="dash" class="grid">
     <div class="stat"><div class="label">业务钟</div><div class="value" style="font-size:1rem">{{ dash.business_clock }}</div></div>
+    <div class="stat">
+      <div class="label">钟面</div>
+      <div class="value" style="font-size:1rem">
+        <span class="tag" :class="dash.clock_fork ? 'bad' : 'ok'">{{ dash.clock_fork ? `${dash.clock_fork} 个分叉批次` : '一致' }}</span>
+      </div>
+    </div>
     <div class="stat"><div class="label">商品</div><div class="value">{{ dash.sku_count }}</div></div>
     <div class="stat"><div class="label">改价单</div><div class="value">{{ dash.ticket_count }}</div></div>
     <div class="stat"><div class="label">待生效</div><div class="value">{{ dash.scheduled_count }}</div></div>

@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.db import connect
 from app.repositories import settings as settings_repo
+from app.services import clock_audit
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -14,10 +15,8 @@ def list_settings():
     finally:
         conn.close()
 
-from app.services import clock_audit
-
 
 @router.get("/clock-audit")
 def clock_audit_view():
+    """钟面一致性视图（与 /api/apply/clock-audit 同一份只读快照）。"""
     return clock_audit.snapshot_clocks()
-
